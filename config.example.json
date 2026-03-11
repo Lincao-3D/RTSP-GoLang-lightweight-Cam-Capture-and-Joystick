@@ -1,0 +1,25 @@
+{
+  "segundos_gravacao": 45,
+  "pasta_videos": "videos",
+  "pasta_temp": "temp_chunks",
+  "upload_url": "https://www.seu_site_aqui.com.br/upload.php",
+  "upload_token": "exemplo_token_abc123_xyz789_2026_fake",
+  "quadras": {
+    "11": {
+      "nome": "quadra1",
+      "url": "rtsp://user:pass@10.0.0.101:554/Streaming/Channels/101"
+    },
+    "08": {
+      "nome": "quadra2",
+      "url": "rtsp://user:pass@10.0.0.102:554/Streaming/Channels/101"
+    },
+    "10": {
+      "nome": "quadra3",
+      "url": "rtsp://user:pass@10.0.0.103:554/Streaming/Channels/101"
+    },
+    "09": {
+      "nome": "quadra4",
+      "url": "rtsp://user:pass@10.0.0.104:554/Streaming/Channels/101"
+    }
+  }
+}
