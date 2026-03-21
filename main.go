@@ -1,20 +1,24 @@
-package main
+//go:build main && !uploader
+
+
+// package main
 
 import (
 	"bytes"
 	"encoding/json"
+	"fmt"
 	"io"
 	"log"
 	"mime/multipart"
 	"net/http"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"time"
 
-	"arena-cam-go/internal" // Substitua pelo nome do seu módulo caso tenha mudado
+	"arena-cam-go/internal"
 )
 
-// Config representa a estrutura do arquivo config.json
 type Config struct {
 	SegundosGravacao int                        `json:"segundos_gravacao"`
 	PastaVideos      string                     `json:"pasta_videos"`
@@ -27,104 +31,134 @@ type Config struct {
 func main() {
 	log.Println("🚀 Iniciando Arena Cam Go...")
 
-	// 1. Ler arquivo de configuração
-	configFile, err := os.ReadFile("config.json")
-	if err != nil {
-		log.Fatalf("❌ Erro ao ler config.json: %v", err)
-	}
+	fmt.Println("======= CONFIGURAÇÃO INICIAL =======")
+	fmt.Print("1. Ativar Upload Automático? (s/n): ")
+	var resp string
+	fmt.Scanln(&resp)
+	autoUpload := (resp == "s" || resp == "S")
 
-	var config Config
-	if err := json.Unmarshal(configFile, &config); err != nil {
-		log.Fatalf("❌ Erro ao fazer parse do config.json: %v", err)
-	}
+	fmt.Print("2. Timeout para desligar captura/PC (em horas, 0 para ilimitado): ")
+	var hours int
+	fmt.Scanln(&hours)
 
-	// 2. Iniciar captura contínua de streams (FFmpeg em background)
+	config := loadConfig()
+	stopChan := make(chan bool)
+
 	for id, cam := range config.Quadras {
-		cam.ID = id // O ID vem da chave do JSON (ex: "11")
+		cam.ID = id
 		cam.TempDir = config.PastaTemp
 		cam.VideoDir = config.PastaVideos
-		config.Quadras[id] = cam // Atualiza o map com os diretórios injetados
+		config.Quadras[id] = cam
 
-		go internal.StartStream(cam)
+		go internal.StartStream(cam, stopChan)
 	}
 
-	// 3. Iniciar listener do Joystick
+	if hours > 0 {
+		go func() {
+			log.Printf("⏰ Timeout configurado para %d horas...", hours)
+			time.Sleep(time.Duration(hours) * time.Hour)
+			log.Println("⏰ Timeout atingido! Encerrando gravações...")
+			close(stopChan)
+			time.Sleep(5 * time.Second)
+			log.Println("💻 Desligando computador...")
+			exec.Command("shutdown", "/s", "/t", "60").Run()
+			os.Exit(0)
+		}()
+	}
+
 	buttonChannel := make(chan string, 10)
 	go internal.ListenJoysticks(buttonChannel)
 
-	// 4. Loop Principal: Aguardar cliques do joystick
 	log.Println("✅ Sistema pronto. Aguardando cliques do joystick...")
 	for buttonID := range buttonChannel {
 		cam, existe := config.Quadras[buttonID]
 		if !existe {
-			log.Printf("⚠️ Botão %s pressionado, mas não está mapeado no config.json\n", buttonID)
+			log.Printf("⚠️ Botão %s não mapeado no config.json\n", buttonID)
 			continue
 		}
-
-		// Dispara a rotina de salvar o vídeo e fazer upload sem travar o app
-		go processClip(cam, config)
+		go processClip(cam, config, autoUpload)
 	}
 }
 
-// processClip compila o vídeo localmente e depois envia para a nuvem
-func processClip(cam internal.Camera, config Config) {
-	// A função SaveClip retorna o caminho do arquivo salvo para podermos fazer o upload
+func processClip(cam internal.Camera, config Config, autoUpload bool) {
 	outName := internal.SaveClip(cam, config.SegundosGravacao)
-
 	if outName == "" {
-		log.Printf("❌ Falha ao gerar clipe da %s\n", cam.Name)
 		return
 	}
 
-	if config.UploadURL != "" {
-		uploadVideo(outName, config.UploadURL, config.UploadToken)
+	if autoUpload {
+		// ✅ Corrigido: Passando cam.Name como 4º argumento
+		uploadVideo(outName, config.UploadURL, config.UploadToken, cam.Name)
+	} else {
+		handleManualUpload(outName, cam.Name, config)
 	}
 }
 
-// uploadVideo faz um POST multipart/form-data para o servidor PHP (Hostinger)
-func uploadVideo(filePath string, url string, token string) {
-	log.Printf("☁️ Iniciando upload de %s para %s...\n", filepath.Base(filePath), url)
+func handleManualUpload(filePath, quadra string, config Config) {
+	fmt.Printf("\n🎬 Replay gerado na %s: %s\n", quadra, filepath.Base(filePath))
+	fmt.Print("Deseja fazer upload para o site agora? (s/n): ")
+	var res string
+	fmt.Scanln(&res)
 
+	if res == "s" || res == "S" {
+		// ✅ Corrigido: Passando quadra como 4º argumento
+		uploadVideo(filePath, config.UploadURL, config.UploadToken, quadra)
+	} else {
+		log.Printf("📁 Vídeo mantido apenas localmente: %s", filePath)
+	}
+}
+
+func uploadVideo(filePath string, url string, token string, quadraName string) {
 	file, err := os.Open(filePath)
 	if err != nil {
-		log.Printf("❌ Erro ao abrir arquivo para upload: %v\n", err)
+		log.Printf("❌ Erro ao abrir arquivo: %v", err)
 		return
 	}
 	defer file.Close()
 
-	var requestBody bytes.Buffer
-	writer := multipart.NewWriter(&requestBody)
+	body := &bytes.Buffer{}
+	writer := multipart.NewWriter(body)
 
-	// Adiciona o campo de token
 	writer.WriteField("token", token)
+	writer.WriteField("dir", quadraName) // Envia "quadra_01", etc.
 
-	// Adiciona o arquivo de vídeo
-	part, err := writer.CreateFormFile("video", filepath.Base(filePath))
-	if err != nil {
-		log.Printf("❌ Erro ao criar formulário multipart: %v\n", err)
-		return
-	}
+	part, _ := writer.CreateFormFile("video", filepath.Base(filePath))
 	io.Copy(part, file)
 	writer.Close()
 
-	req, err := http.NewRequest("POST", url, &requestBody)
-	if err != nil {
-		log.Printf("❌ Erro ao criar requisição de upload: %v\n", err)
-		return
-	}
+	log.Printf("☁️ Enviando %s para %s...", filepath.Base(filePath), quadraName)
+
+	req, _ := http.NewRequest("POST", url, body)
 	req.Header.Set("Content-Type", writer.FormDataContentType())
 
-	client := &http.Client{Timeout: 5 * time.Minute} // Timeout longo para uploads pesados
+	client := &http.Client{
+		CheckRedirect: func(req *http.Request, via []*http.Request) error {
+			return http.ErrUseLastResponse // Evita falso positivo de redirecionamento
+		},
+		Timeout: 5 * time.Minute,
+	}
+
 	resp, err := client.Do(req)
 	if err != nil {
-		log.Printf("❌ Falha na conexão de upload: %v\n", err)
+		log.Printf("❌ Falha de rede: %v\n", err)
 		return
 	}
 	defer resp.Body.Close()
 
-	if resp.StatusCode == http.StatusOK || resp.StatusCode == http.StatusFound {
-		log.Printf("✅ Upload concluído com sucesso: %s\n", filepath.Base(filePath))
+	if resp.StatusCode == http.StatusOK {
+		log.Printf("✅ Upload concluído com sucesso!")
 	} else {
-		log.Printf("⚠️ Erro no servidor (Status %d) ao enviar %s\n", resp.StatusCode, filepath.Base(filePath))
+		bodyBytes, _ := io.ReadAll(resp.Body)
+		log.Printf("⚠️ Erro no Servidor (%d): %s\n", resp.StatusCode, string(bodyBytes))
 	}
+}
+
+func loadConfig() Config {
+	configFile, err := os.ReadFile("config.json")
+	if err != nil {
+		log.Fatalf("❌ Erro ao ler config.json: %v", err)
+	}
+	var config Config
+	json.Unmarshal(configFile, &config)
+	return config
 }

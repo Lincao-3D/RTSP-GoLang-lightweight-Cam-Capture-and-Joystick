@@ -10,60 +10,81 @@ import (
 	"time"
 )
 
-// Camera represents a single court's stream configuration
 type Camera struct {
-	ID       string
-	Name     string
-	URL      string
-	TempDir  string
-	VideoDir string
+	ID       string `json:"-"`
+	Name     string `json:"nome"`
+	URL      string `json:"url"`
+	TempDir  string `json:"-"`
+	VideoDir string `json:"-"`
 }
 
-// StartStream launches a background FFmpeg process to capture 2s rolling chunks
-func StartStream(cam Camera) {
-	// Ensure temp directory exists
+func getFFmpegPath() string {
+	if exePath, err := os.Executable(); err == nil {
+		local := filepath.Join(filepath.Dir(exePath), "ffmpeg.exe")
+		if _, err := os.Stat(local); err == nil {
+			return local
+		}
+	}
+	return "ffmpeg"
+}
+
+// StartStream agora é NON-STOP: Se cair, reinicia automaticamente
+func StartStream(cam Camera, stopChan chan bool) {
 	camTemp := filepath.Join(cam.TempDir, cam.Name)
 	os.MkdirAll(camTemp, 0755)
 
-	// FFmpeg command: read RTSP, copy stream (no encode), split into 2s .ts chunks
-	args := []string{
-		"-y",
-		"-rtsp_transport", "tcp",
-		"-i", cam.URL,
-		"-c", "copy",
-		"-f", "segment",
-		"-segment_time", "2",
-		"-segment_format", "ts",
-		"-reset_timestamps", "1",
-		filepath.Join(camTemp, "chunk_%05d.ts"),
+	// Cleanup goroutine tied to this stream's lifetime
+	cleanupStop := make(chan bool)
+	go cleanupOldChunks(camTemp, 60*time.Second, cleanupStop)
+
+	// Cleanup will stop when StartStream returns
+	defer close(cleanupStop)
+
+	for {
+		select {
+		case <-stopChan:
+			log.Printf("🛑 Parando captura da %s por timeout.", cam.Name)
+			return
+		default:
+			args := []string{
+				"-loglevel", "error",
+				"-y",
+				"-rtsp_transport", "tcp",
+				"-i", cam.URL,
+				"-c", "copy",
+				"-f", "segment",
+				"-segment_time", "2",
+				"-segment_format", "ts",
+				"-reset_timestamps", "1",
+				filepath.Join(camTemp, "chunk_%05d.ts"),
+			}
+
+			cmd := exec.Command(getFFmpegPath(), args...)
+			if err := cmd.Start(); err != nil {
+				log.Printf("❌ Falha na %s: %v. Tentando em 5s...", cam.Name, err)
+				time.Sleep(5 * time.Second)
+				continue
+			}
+
+			log.Printf("📹 [Capturando] %s", cam.Name)
+
+			cmd.Wait() // Se o FFmpeg fechar, o loop continua e reinicia
+			log.Printf("⚠️  Stream %s caiu. Reiniciando...", cam.Name)
+			time.Sleep(3 * time.Second)
+		}
 	}
-
-	cmd := exec.Command("ffmpeg", args...)
-
-	err := cmd.Start()
-	if err != nil {
-		log.Printf("[Erro] Falha ao iniciar stream da %s: %v\n", cam.Name, err)
-		return
-	}
-
-	log.Printf("🎥 Captura contínua iniciada para: %s\n", cam.Name)
-
-	// Start background cleanup to prevent disk fill-up (keeps only the last ~60 seconds)
-	go cleanupOldChunks(camTemp, 60*time.Second)
-
-	// Wait will block until the FFmpeg process crashes or stops
-	cmd.Wait()
-	log.Printf("⚠️ Stream da %s caiu ou foi finalizado.\n", cam.Name)
 }
 
-// old: SaveClip is called when the joystick button is pressed
-// SaveClip agora retorna uma string (o caminho do arquivo salvo)
-func SaveClip(cam Camera, clipDuration int) string {
-	camTemp := filepath.Join(cam.TempDir, cam.Name)
+func SaveClip(cam Camera, duration int) string {
+	camTemp, err := filepath.Abs(filepath.Join(cam.TempDir, cam.Name))
+	if err != nil {
+		log.Printf("❌ SaveClip: erro ao resolver camTemp: %v", err)
+		return ""
+	}
 
 	files, err := os.ReadDir(camTemp)
 	if err != nil {
-		log.Printf("[Erro] Não foi possível ler a pasta temp da %s: %v\n", cam.Name, err)
+		log.Printf("❌ SaveClip: erro ao ler %s: %v", camTemp, err)
 		return ""
 	}
 
@@ -75,7 +96,7 @@ func SaveClip(cam Camera, clipDuration int) string {
 	}
 
 	if len(tsFiles) < 2 {
-		log.Printf("⚠️ Sem fragmentos suficientes para %s. Aguarde...\n", cam.Name)
+		log.Printf("⚠️ Sem fragmentos suficientes para %s. Aguarde...", cam.Name)
 		return ""
 	}
 
@@ -83,62 +104,86 @@ func SaveClip(cam Camera, clipDuration int) string {
 		return tsFiles[i].Name() < tsFiles[j].Name()
 	})
 
-	chunksNeeded := (clipDuration / 2) + 1
-	if chunksNeeded > len(tsFiles) {
-		chunksNeeded = len(tsFiles)
+	needed := (duration / 2) + 1
+	if needed > len(tsFiles) {
+		needed = len(tsFiles)
+	}
+	selected := tsFiles[len(tsFiles)-needed:]
+
+	absOutDir, err := filepath.Abs(filepath.Join(cam.VideoDir, cam.Name))
+	if err != nil {
+		log.Printf("❌ SaveClip: erro ao resolver outDir: %v", err)
+		return ""
+	}
+	os.MkdirAll(absOutDir, 0755)
+	outName := filepath.Join(absOutDir, fmt.Sprintf("%s_%d.mp4", cam.Name, time.Now().Unix()))
+
+	// Unique concat file per clip (like original)
+	concatFile := filepath.Join(camTemp, fmt.Sprintf("concat_%d.txt", time.Now().UnixMilli()))
+	f, err := os.Create(concatFile)
+	if err != nil {
+		log.Printf("❌ SaveClip: erro ao criar concat: %v", err)
+		return ""
+	}
+	defer f.Close()
+	defer os.Remove(concatFile) // Auto cleanup
+
+	for _, ts := range selected {
+		fmt.Fprintf(f, "file '%s'\n", ts.Name())
 	}
 
-	selectedFiles := tsFiles[len(tsFiles)-chunksNeeded:]
+	log.Printf("🎬 Compilando clipe da %s (~%ds)...", cam.Name, duration)
 
-	concatFileName := fmt.Sprintf("concat_%d.txt", time.Now().UnixMilli())
-	concatFilePath := filepath.Join(camTemp, concatFileName)
-	f, err := os.Create(concatFilePath)
-	if err != nil {
+	cmd := exec.Command(
+		getFFmpegPath(),
+		"-loglevel", "error",
+		"-y",
+		"-f", "concat",
+		"-safe", "0",
+		"-i", filepath.Base(concatFile),
+		"-c", "copy",
+		outName,
+	)
+	cmd.Dir = camTemp
+
+	if err := cmd.Run(); err != nil {
+		log.Printf("❌ Erro ao salvar vídeo %s: %v", cam.Name, err)
 		return ""
 	}
 
-	for _, ts := range selectedFiles {
-		f.WriteString(fmt.Sprintf("file '%s'\n", ts.Name()))
-	}
-	f.Close()
-	defer os.Remove(concatFilePath)
-
-	timestamp := time.Now().Unix()
-	outDir := filepath.Join(cam.VideoDir, cam.Name)
-	os.MkdirAll(outDir, 0755)
-	outName := filepath.Join(outDir, fmt.Sprintf("%s_%d.mp4", cam.Name, timestamp))
-
-	log.Printf("🎬 Compilando clipe da %s (~%ds)...\n", cam.Name, clipDuration)
-
-	concatCmd := exec.Command("ffmpeg", "-y", "-f", "concat", "-safe", "0", "-i", concatFileName, "-c", "copy", outName)
-	concatCmd.Dir = camTemp
-
-	err = concatCmd.Run()
-	if err != nil {
-		log.Printf("❌ Erro ao salvar vídeo %s: %v\n", cam.Name, err)
-		return ""
-	}
-
-	log.Printf("✅ Vídeo salvo: %s\n", outName)
-	return outName // <--- IMPORTANTE: Retornamos o caminho aqui
+	log.Printf("✅ Replay gerado: %s", outName)
+	return outName
 }
 
-// cleanupOldChunks continuously runs in the background deleting files older than maxAge
-func cleanupOldChunks(dir string, maxAge time.Duration) {
-	for {
-		time.Sleep(10 * time.Second) // Check every 10 seconds
-		files, err := os.ReadDir(dir)
-		if err != nil {
-			continue
-		}
+// cleanupOldChunks runs continuously during the stream lifetime, stops when stopChan closes
+func cleanupOldChunks(dir string, maxAge time.Duration, stopChan chan bool) {
+	ticker := time.NewTicker(10 * time.Second)
+	defer ticker.Stop()
 
-		now := time.Now()
-		for _, f := range files {
-			if filepath.Ext(f.Name()) == ".ts" {
-				info, err := f.Info()
-				if err == nil && now.Sub(info.ModTime()) > maxAge {
-					os.Remove(filepath.Join(dir, f.Name()))
+	for {
+		select {
+		case <-stopChan:
+			log.Printf("🧹 Cleanup finalizado para %s", filepath.Base(dir))
+			return
+		case <-ticker.C:
+			files, err := os.ReadDir(dir)
+			if err != nil {
+				continue
+			}
+
+			now := time.Now()
+			deleted := 0
+			for _, f := range files {
+				if filepath.Ext(f.Name()) == ".ts" {
+					if info, err := f.Info(); err == nil && now.Sub(info.ModTime()) > maxAge {
+						if err := os.Remove(filepath.Join(dir, f.Name())); err == nil {
+							deleted++
+						}
+					}
 				}
+			}
+			if deleted > 0 {
+				log.Printf("🧹 Limpou %d chunks antigos de %s", deleted, filepath.Base(dir))
 			}
 		}
 	}
