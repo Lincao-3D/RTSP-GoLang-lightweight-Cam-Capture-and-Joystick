@@ -1,3 +1,6 @@
 # The file with actual info, similar to our example file config.example.json
-config.jsonarena-cam-go.exe
+config.json
+arena-cam-go.exe
 *.7z
+*.exe
+.vscode
