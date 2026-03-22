@@ -16,11 +16,15 @@
 
 Abra o terminal no diretório do projeto e execute:
 ```bash
-# Para compilar para Windows a partir do WSL ou Linux
+# Para o executável principal, compilando para Windows a partir do WSL ou Linux
 GOOS=windows GOARCH=amd64 go build -o arena-cam.exe main.go
 
-# Para um arquivo ainda menor, rode:
+# Para um executável principal ainda menor, rode:
 GOOS=windows GOARCH=amd64 go build -ldflags="-s -w" -o arena-cam-go.exe .
+
+# Para o executável do uploader (que é ativado pelo executável principal ou ativado diretamente pelo usuário dentro da pasta da quadra em questão)
+GOOS=windows GOARCH=amd64 go build -tags uploader -ldflags="-H windowsgui -s -w" -o uploader.exe .
+# Este ↑ executável é projetado para ser copiado para dentro de cada pasta de vídeo (ex: videos/quadra_01/). Ele utiliza uma flag para ocultar a janela do console, tornando a execução mais elegante. Caso não queira remova "-H windowsgui".
 ```
 - Ícone: Para embutir o ícone, você deve ter um arquivo rsrc.syso (ou similar) na pasta, gerado a partir do seu icon_BR.ico - e, também, utilizar o "." no final do seu comando de build ao invés do arquivo `.go` (para o Go ler todo o conteúdo da pasta).
 ```bash
