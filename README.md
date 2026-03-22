@@ -82,6 +82,3 @@ JSON
 }
 ```
 (A chave "0" refere-se ao ID do botão do Joystick).
-
-
-This structure sets you up with a fast, scalable background daemon that avoids the pitfalls of trying to do real-time computer vision processing in a scripted language. Let me know if you need to fine-tune the FFmpeg parameters or tweak the HTTP upload behavior!
